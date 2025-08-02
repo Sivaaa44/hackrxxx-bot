@@ -1,59 +1,66 @@
 import requests
 from pinecone import Pinecone, ServerlessSpec
 from typing import List, Dict, Any
-from config import PINECONE_API_KEY, PINECONE_INDEX_NAME, AIPROXY_TOKEN, OPEN_AI_PROXY_URL, OPEN_AI_EMBEDDING_URL
+from config import PINECONE_API_KEY, PINECONE_INDEX_NAME, RAPIDAPI_EMBEDDING_URL, RAPIDAPI_KEY, AIPROXY_TOKEN, OPEN_AI_PROXY_URL
 from pdf_utils import chunk_text
 import time
 
 # Initialize Pinecone
 pc = Pinecone(api_key=PINECONE_API_KEY)
-if PINECONE_INDEX_NAME not in pc.list_indexes().names():
-    pc.create_index(
-        name=PINECONE_INDEX_NAME,
-        dimension=1536,  # OpenAI embeddings are 1536 dimensions
-        metric="cosine",
-        spec=ServerlessSpec(
-            cloud="aws",      # or "gcp" if you prefer
-            region="us-east-1"  # or another supported region
+try:
+    if PINECONE_INDEX_NAME not in pc.list_indexes().names():
+        pc.create_index(
+            name=PINECONE_INDEX_NAME,
+            dimension=3072,  # Updated to match text-embedding-3-large
+            metric="cosine",
+            spec=ServerlessSpec(
+                cloud="aws",
+                region="us-east-1"
+            )
         )
-    )
-    while not pc.describe_index(PINECONE_INDEX_NAME).status["ready"]:
-        time.sleep(1)
+        while not pc.describe_index(PINECONE_INDEX_NAME).status["ready"]:
+            time.sleep(1)
+except Exception as e:
+    print(f"Warning: Could not create index due to {e}. Proceeding with existing index if available.")
+    if PINECONE_INDEX_NAME not in pc.list_indexes().names():
+        raise Exception("No index available and creation failed. Please check your pod limit and try again.")
 index = pc.Index(PINECONE_INDEX_NAME)
 
 # Headers for API requests
-headers = {
+rapidapi_headers = {
+    "x-rapidapi-key": RAPIDAPI_KEY,
+    "x-rapidapi-host": "openai-embedding-v3-large.p.rapidapi.com",
+    "Content-Type": "application/json"
+}
+proxy_headers = {
     "Authorization": f"Bearer {AIPROXY_TOKEN}",
     "Content-Type": "application/json"
 }
 
 def get_openai_embedding(text: str) -> List[float]:
-    """Get embedding from OpenAI API proxy with fallback models."""
-    models_to_try = ["text-embedding-3-small", "text-embedding-3-large", "text-similarity-davinci-001"]
-    for model in models_to_try:
-        payload = {
-            "model": model,
-            "input": text
-        }
-        response = requests.post(OPEN_AI_EMBEDDING_URL, json=payload, headers=headers)
-        if response.status_code == 200:
-            return response.json()["data"][0]["embedding"]
-        elif "Invalid model" not in response.text:
-            raise Exception(f"Embedding API error: {response.text}")
-        print(f"Model {model} not supported, trying next...")
-    raise Exception("No supported embedding model found. Check proxy documentation or API support.")
+    """Get embedding from RapidAPI endpoint."""
+    payload = {
+        "input": text,
+        "model": "text-embedding-3-large",
+        "encoding_format": "float"
+    }
+    response = requests.post(RAPIDAPI_EMBEDDING_URL, json=payload, headers=rapidapi_headers)
+    if response.status_code == 200:
+        return response.json()["data"][0]["embedding"]
+    else:
+        raise Exception(f"Embedding API error: {response.text}")
 
 def optimize_query(query: str) -> List[str]:
     """Optimize query using OpenAI chat completion API to detect intents."""
     payload = {
-        "model": "gpt-3.5-turbo",  # Adjust based on available models
+        "model": "gpt-3.5-turbo",
         "messages": [
             {"role": "system", "content": "You are a helpful assistant that splits user queries into specific sub-queries based on intent."},
             {"role": "user", "content": f"Split the following query into specific sub-queries: {query}"}
         ],
         "max_tokens": 50
     }
-    response = requests.post(OPEN_AI_PROXY_URL, json=payload, headers=headers)
+    response = requests.post(OPEN_AI_PROXY_URL, json=payload, headers=proxy_headers)
     if response.status_code == 200:
         sub_queries = response.json()["choices"][0]["message"]["content"].strip().split("\n")
         return [q.strip() for q in sub_queries if q.strip()]
@@ -62,7 +69,7 @@ def optimize_query(query: str) -> List[str]:
         return [query]  # Fallback to original query
 
 def process_and_store_chunks(chunks: List[Dict[str, Any]], document_id: str) -> None:
-    """Generate embeddings and store in Pinecone using OpenAI API."""
+    """Generate embeddings and store in Pinecone using RapidAPI."""
     for i, chunk in enumerate(chunks):
         text = chunk["text"]
         if chunk["metadata"]["type"] == "table":
